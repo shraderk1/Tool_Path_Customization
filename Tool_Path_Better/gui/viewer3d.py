@@ -2,7 +2,8 @@
 # Visualizes a single G-code layer with a slider to animate extrusion
 
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QSlider, QLabel
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QPointF
+from PyQt5.QtGui import QVector3D
 import pyqtgraph.opengl as gl
 import pyqtgraph as pg
 import numpy as np
@@ -22,11 +23,31 @@ class Layer3DViewer(QWidget):
         self.slider.setMinimum(0)
         self.slider.valueChanged.connect(self.update_view)
         self.layout.addWidget(self.slider)
-        self.layer_moves = []  # List of (x, y, extrude) tuples
+        self.layer_moves = []  # List of (x, y, extrude, move_type) tuples
         self.extruder_dot = None
         self.line_items = []
         self.setMinimumHeight(400)
         self._init_view()
+        # Dragging state
+        self.dragging = False
+        self.drag_start_pos = None
+        self.drag_current_pos = None
+        self.drag_preview_line = None
+        self.drag_head_dot = None
+        self.installEventFilter(self)
+        self.gl_widget.mousePressEvent = self._on_mouse_press
+        self.gl_widget.mouseMoveEvent = self._on_mouse_move
+        self.gl_widget.mouseReleaseEvent = self._on_mouse_release
+        self._extruder_head_screen_radius = 20  # for hit test
+        # Enable mouse tracking for the GLViewWidget
+        self.gl_widget.setMouseTracking(True)
+        self.setMouseTracking(True)
+        # Disable camera rotation and panning
+        self.gl_widget.orbit = lambda *args, **kwargs: None
+        self.gl_widget.pan = lambda *args, **kwargs: None
+        self.gl_widget.mouseDragEvent = lambda *args, **kwargs: None
+        # Store extruder head position for hit testing
+        self._extruder_head_world_pos = None
 
     def _init_view(self):
         # Set up a white background and grid for better visibility
@@ -64,11 +85,12 @@ class Layer3DViewer(QWidget):
 
     def clear_scene(self):
         for item in self.line_items:
-            self.gl_widget.removeItem(item)
+            try:
+                self.gl_widget.removeItem(item)
+            except ValueError:
+                pass  # Item was already removed
         self.line_items = []
-        if self.extruder_dot:
-            self.gl_widget.removeItem(self.extruder_dot)
-            self.extruder_dot = None
+        self.drag_head_dot = None
 
     def update_view(self, value):
         self.clear_scene()
@@ -126,7 +148,25 @@ class Layer3DViewer(QWidget):
             pos = self.layer_moves[value-1][:2]
         else:
             pos = self.layer_moves[0][:2]
-        # Use a filled, opaque, always-on-top red circle using OpenGL directly, half previous size
+        # If dragging, show the extruder head at the drag position
+        if self.dragging and self.drag_current_pos:
+            self._extruder_head_world_pos = self.drag_current_pos
+            self._draw_extruder_head_dot(self.drag_current_pos, dragging=True)
+            # Draw the drag preview line
+            self._draw_drag_preview()
+        else:
+            self._extruder_head_world_pos = pos
+            self._draw_extruder_head_dot(pos, dragging=False)
+
+    def _draw_extruder_head_dot(self, pos, dragging=False):
+        # Remove any previous extruder head dot from the scene
+        if self.drag_head_dot:
+            try:
+                self.gl_widget.removeItem(self.drag_head_dot)
+            except ValueError:
+                pass
+            self.drag_head_dot = None
+        # Use a filled, opaque, always-on-top circle using OpenGL directly
         from pyqtgraph.opengl.GLGraphicsItem import GLGraphicsItem
         from OpenGL.GL import glColor4f, glBegin, glEnd, glVertex3f, GL_TRIANGLE_FAN
         import math
@@ -146,6 +186,151 @@ class Layer3DViewer(QWidget):
                     y = self.pos[1] + self.radius * math.sin(angle)
                     glVertex3f(x, y, 0.2)
                 glEnd()
-        dot = ExtruderHeadDot((pos[0], pos[1]))
+        # Enlarge and change color if dragging
+        if dragging:
+            color = (0.5, 0, 0, 1)  # maroon
+            radius = 2.0
+        else:
+            color = (1, 0, 0, 1)  # red
+            radius = 1.25
+        dot = ExtruderHeadDot((pos[0], pos[1]), radius=radius, color=color)
         self.gl_widget.addItem(dot)
         self.line_items.append(dot)
+        self.drag_head_dot = dot
+
+    def _is_near_extruder_head(self, world_pos, threshold=3.0):
+        # Check if the click is within threshold distance of the extruder head
+        if not self.layer_moves:
+            return False
+        idx = self.slider.value() - 1 if self.slider.value() > 0 else 0
+        head_pos = self.layer_moves[idx][:2]
+        dx = world_pos[0] - head_pos[0]
+        dy = world_pos[1] - head_pos[1]
+        return (dx*dx + dy*dy) ** 0.5 < threshold
+
+    def _is_near_extruder_head_screen(self, screen_pos):
+        # Use OpenGL projection to map world to screen for accurate hit testing
+        if self._extruder_head_world_pos is None:
+            print("[DEBUG] No extruder head world position set.")
+            return False
+        # Get OpenGL projection and view matrices
+        try:
+            import pyqtgraph.opengl as gl
+            import numpy as np
+            widget = self.gl_widget
+            pos3d = np.array([self._extruder_head_world_pos[0], self._extruder_head_world_pos[1], 0, 1])
+            proj = widget.projectionMatrix().data()
+            view = widget.viewMatrix().data()
+            # Convert to numpy arrays
+            proj = np.array(proj).reshape((4,4)).T
+            view = np.array(view).reshape((4,4)).T
+            mvp = np.dot(proj, view)
+            screen = np.dot(mvp, pos3d)
+            screen /= screen[3]
+            # screen x/y in range [-1, 1], map to widget pixel coordinates
+            w, h = widget.width(), widget.height()
+            x = (screen[0] * 0.5 + 0.5) * w
+            y = (1 - (screen[1] * 0.5 + 0.5)) * h
+            dx = screen_pos.x() - x
+            dy = screen_pos.y() - y
+            dist = (dx*dx + dy*dy) ** 0.5
+            print(f"[DEBUG] Click at ({screen_pos.x()}, {screen_pos.y()}) | Head at ({x:.1f}, {y:.1f}) | dist={dist:.1f}")
+            return dist < 40
+        except Exception as e:
+            print(f"[DEBUG] OpenGL projection error: {e}")
+            return False
+
+    def _on_mouse_press(self, event):
+        if event.button() == Qt.LeftButton:
+            pos = event.pos()
+            # Use the current extruder head world position as the drag start
+            world_pos = self._extruder_head_world_pos
+            print(f"[DEBUG] Mouse press at screen {pos.x()}, {pos.y()} | world {world_pos}")
+            if world_pos is not None:
+                if self._is_near_extruder_head_screen(pos):
+                    print("[DEBUG] Extruder head clicked!")
+                    self.dragging = True
+                    self.drag_start_pos = world_pos
+                    self.drag_current_pos = world_pos
+                    self._drag_offset = (pos.x(), pos.y(), world_pos[0], world_pos[1])
+                    self._draw_drag_preview()
+                    self.update_view(self.slider.value())
+                    event.accept()
+                    return
+                else:
+                    print("[DEBUG] Click NOT on extruder head.")
+        event.ignore()
+
+    def _on_mouse_move(self, event):
+        if self.dragging:
+            pos = event.pos()
+            # Calculate the world position based on the initial offset
+            try:
+                size = self.gl_widget.size()
+                w, h = size.width(), size.height()
+                min_x, max_x, min_y, max_y = self._layer_bounds
+                dx = pos.x() - self._drag_offset[0]
+                dy = pos.y() - self._drag_offset[1]
+                # Convert pixel delta to world delta
+                world_dx = dx / w * (max_x - min_x)
+                world_dy = -dy / h * (max_y - min_y)
+                new_x = self._drag_offset[2] + world_dx
+                new_y = self._drag_offset[3] + world_dy
+                self.drag_current_pos = (new_x, new_y)
+                self.update_view(self.slider.value())
+            except Exception as e:
+                print(f"[DEBUG] Drag error: {e}")
+            event.accept()
+            return
+        event.ignore()
+
+    def _on_mouse_release(self, event):
+        if self.dragging:
+            self.dragging = False
+            self._remove_drag_preview()
+            self.update_view(self.slider.value())
+            print(f"[DEBUG] New travel move: {self.drag_start_pos} -> {self.drag_current_pos}")
+            event.accept()
+            return
+        event.ignore()
+
+    def _draw_drag_preview(self):
+        self._remove_drag_preview()
+        if self.drag_start_pos and self.drag_current_pos:
+            pts = np.array([
+                [self.drag_start_pos[0], self.drag_start_pos[1], 0.3],
+                [self.drag_current_pos[0], self.drag_current_pos[1], 0.3]
+            ])
+            # Only draw the preview if the drag is not a zero-length move
+            if not (abs(self.drag_start_pos[0] - self.drag_current_pos[0]) < 1e-6 and abs(self.drag_start_pos[1] - self.drag_current_pos[1]) < 1e-6):
+                n_dots = int(np.linalg.norm(pts[1, :2] - pts[0, :2]) / 0.5)
+                n_dots = max(n_dots, 4)
+                dots = np.linspace(0, 1, n_dots)
+                self.drag_preview_lines = []
+                for j in range(n_dots - 1):
+                    seg_start = pts[0] * (1 - dots[j]) + pts[1] * dots[j]
+                    seg_end = pts[0] * (1 - dots[j+1]) + pts[1] * dots[j+1]
+                    if j % 2 == 0:
+                        seg = np.array([seg_start, seg_end])
+                        line = gl.GLLinePlotItem(pos=seg, color=(0,1,0,1), width=3, antialias=True)
+                        self.gl_widget.addItem(line)
+                        self.drag_preview_lines.append(line)
+
+    def _remove_drag_preview(self):
+        if hasattr(self, 'drag_preview_lines'):
+            for line in self.drag_preview_lines:
+                try:
+                    self.gl_widget.removeItem(line)
+                except Exception:
+                    pass
+            self.drag_preview_lines = []
+
+    def _screen_to_world(self, pos):
+        # Convert 2D screen position to 3D world coordinates (approximate, top-down)
+        # This is a simple approximation for a top-down view
+        size = self.gl_widget.size()
+        w, h = size.width(), size.height()
+        min_x, max_x, min_y, max_y = self._layer_bounds
+        x = min_x + (max_x - min_x) * pos.x() / w
+        y = min_y + (max_y - min_y) * (h - pos.y()) / h
+        return (x, y)
